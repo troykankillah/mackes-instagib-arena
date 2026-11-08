@@ -960,6 +960,142 @@ function updateMissiles(dt) {
   }
 }
 
+// ================= The dragon (Rymdgården only) =================
+// A huge dragon circles the yard. Every cycle it picks one half of the map, roars and turns
+// that half red, then sets it on fire. Everyone runs the same clock (wall time), so all
+// players see the same half burn without any network traffic; each client judges itself.
+const DRAGON_CYCLE = 45, DRAGON_WARN = 7, DRAGON_BURN = 4, DRAGON_SAFE = 40; // safe within ±40 of the middle line
+const DRAGON_SRC = { name: 'Draken', team: 'sq', remote: true, alive: false };
+const dragon = MAP === MAPS.yard ? (() => {
+  const g = new T.Group(), body = new T.Group(); g.add(body);
+  const scale = mkMat(0xb0281a, { transparent: false, emissive: 0x4a0a04, fog: false }), belly = mkMat(0xf0b050, { transparent: false, emissive: 0x3a2008, fog: false }), horn = mkMat(0xf2ead8, { transparent: false, emissive: 0x302820, fog: false });
+  const eyeM = new T.MeshBasicMaterial({ color: 0xffe14d, fog: false });
+  // the spine: a chain of spheres from the neck down the tail, built along +Z (the head end)
+  const segs = [];
+  const R = i => i < 5 ? 26 - i * 0.6 : i < 9 ? 60 - Math.abs(i - 6.5) * 6 : Math.max(8, 48 - (i - 9) * 4);
+  for (let i = 0; i < 20; i++) {
+    const s = new T.Mesh(SPH, scale); s.scale.setScalar(R(i)); body.add(s);
+    const b = new T.Mesh(SPH, belly); b.scale.set(0.8, 0.55, 0.9); b.position.y = -0.45; s.add(b);
+    if (i % 2 === 0 && i < 18) { const sp = new T.Mesh(CONE, horn); sp.scale.set(0.18, 0.5, 0.18); sp.position.y = 0.95; s.add(sp); }
+    segs.push(s);
+  }
+  // head with a jaw that opens to breathe
+  const head = new T.Group(); body.add(head);
+  addMesh(head, SPH, scale, 0, 0, 30, 30, 24, 46);
+  addMesh(head, SPH, scale, 0, -2, 70, 18, 14, 30);           // snout
+  const jaw = new T.Group(); jaw.position.set(0, -12, 30); head.add(jaw);
+  addMesh(jaw, SPH, belly, 0, -4, 30, 16, 7, 36);
+  for (const s of [-1, 1]) {
+    const h = addMesh(head, CONE, horn, s * 16, 22, 4, 5, 34, 5); h.rotation.x = -1.1; h.rotation.z = -s * 0.3;
+    addMesh(head, SPH, eyeM, s * 15, 9, 50, 4.5, 3.5, 4.5);
+  }
+  const mouth = new T.Object3D(); mouth.position.set(0, -8, 100); head.add(mouth);
+  // wings: two big membranes on bony fingers
+  const wingGeo = new T.BufferGeometry();
+  wingGeo.setAttribute('position', new T.Float32BufferAttribute([0, 0, 40, 420, 60, -60, 380, -10, -160, 0, 0, 40, 380, -10, -160, 230, -30, -230, 0, 0, 40, 230, -30, -230, 0, 0, -120], 3));
+  wingGeo.computeVertexNormals();
+  const memb = new T.MeshLambertMaterial({ color: 0x8a1e2a, side: T.DoubleSide, emissive: 0x3a0810, fog: false });
+  const wings = [-1, 1].map(s => { const w = new T.Mesh(wingGeo, memb); w.scale.x = s; body.add(w); return w; });
+  g.scale.setScalar(4.6);
+  scene.add(g);
+  // the warning zone: a red glowing volume over the half that is about to burn
+  const zoneM = new T.MeshBasicMaterial({ color: 0xff2a10, transparent: true, opacity: 0, side: T.DoubleSide, depthWrite: false, blending: T.AdditiveBlending });
+  const zone = new T.Mesh(new T.BoxGeometry(3000, 700, 3200), zoneM); zone.visible = false; scene.add(zone);
+  // fire: one pooled particle system
+  const N = 900, pos = new Float32Array(N * 3).fill(-1e5), vel = new Float32Array(N * 3), life = new Float32Array(N);
+  const fg = new T.BufferGeometry(); fg.setAttribute('position', new T.BufferAttribute(pos, 3));
+  const fire = new T.Points(fg, new T.PointsMaterial({ color: 0xff8a2a, size: 70, transparent: true, opacity: 0.85, blending: T.AdditiveBlending, depthWrite: false }));
+  fire.frustumCulled = false; scene.add(fire);
+  return { g, body, segs, head, jaw, mouth, wings, zone, zoneM, fire, fg, pos, vel, life, N, fi: 0, side: 1, phase: 'idle', lastPhase: '', lastCount: -1, emit: 0, roared: -1 };
+})() : null;
+
+function dragonClock() {
+  const t = Date.now() / 1000, cycle = Math.floor(t / DRAGON_CYCLE), u = t - cycle * DRAGON_CYCLE;
+  const side = ((Math.imul(cycle, 2654435761) >>> 0) % 2) ? 1 : -1;
+  const burnAt = DRAGON_CYCLE - DRAGON_BURN - 4, warnAt = burnAt - DRAGON_WARN;
+  const phase = u < warnAt ? 'idle' : u < burnAt ? 'warn' : u < burnAt + DRAGON_BURN ? 'burn' : 'idle';
+  return { phase, side, left: burnAt - u, cycle };
+}
+const inDragonFire = (e, side) => e.pos.z * side > DRAGON_SAFE;
+
+// physics side: run with the tick, kills whatever of ours stands in the burning half
+function dragonTick() {
+  if (!dragon) return;
+  const c = dragonClock();
+  dragon.side = c.side;
+  if (c.phase !== 'burn') return;
+  for (const e of ents) if (e.alive && !e.remote && inDragonFire(e, c.side)) kill(e, DRAGON_SRC);
+}
+function dragonDanger(b) { return dragon && dragon.phase !== 'idle' && b.pos.z * dragon.side > -150; }
+
+// visual side: every frame
+const _dt = new T.Vector3(), _dm = new T.Vector3();
+function updateDragon(dt) {
+  if (!dragon) return;
+  const d = dragon, c = dragonClock(), tt = performance.now() / 1000;
+  d.phase = c.phase; d.side = c.side;
+  // where it flies: a lazy circle far out, then over to hover beside the doomed half
+  let px, py, pz, lx, ly, lz;
+  if (c.phase === 'idle') {
+    const a = tt * 0.12;
+    px = Math.cos(a) * 4200; pz = Math.sin(a) * 5200; py = 1500 + Math.sin(tt * 0.5) * 200;
+    lx = Math.cos(a + 0.2) * 4200; lz = Math.sin(a + 0.2) * 5200; ly = py;
+  } else {
+    px = 2900; py = 1550 + Math.sin(tt * 1.3) * 60; pz = c.side * 1700;
+    lx = 0; ly = 0; lz = c.side * 1700;
+  }
+  const k = 1 - Math.exp(-dt * (c.phase === 'idle' ? 0.6 : 1.2));
+  d.g.position.lerp(_dt.set(px, py, pz), k);
+  _dm.set(lx, ly, lz);
+  const q = d.g.quaternion.clone(); d.g.lookAt(_dm); const want = d.g.quaternion.clone(); d.g.quaternion.copy(q).slerp(want, k);
+  // body ripple, wing flaps, jaw
+  d.segs.forEach((s, i) => s.position.set(Math.sin(tt * 1.6 - i * 0.45) * (6 + i * 1.5), Math.sin(tt * 2.1 - i * 0.5) * (4 + i), 40 - i * 34));
+  d.head.position.copy(d.segs[0].position).add(_dt.set(0, 8, 24));
+  const flap = Math.sin(tt * (c.phase === 'idle' ? 2.2 : 3.2)) * 0.55;
+  d.wings[0].rotation.z = flap; d.wings[1].rotation.z = -flap;
+  d.wings.forEach(w => w.position.copy(d.segs[6].position).add(_dt.set(0, 30, 0)));
+  d.jaw.rotation.x = c.phase === 'burn' ? 0.55 + Math.sin(tt * 20) * 0.05 : c.phase === 'warn' ? 0.15 + Math.max(0, Math.sin(tt * 3)) * 0.2 : 0.05;
+  // warning zone
+  d.zone.visible = c.phase !== 'idle';
+  d.zone.position.set(0, 120, c.side * (DRAGON_SAFE + 1600));
+  d.zoneM.color.setHex(c.phase === 'burn' ? 0xff7a1a : 0xff2a10);
+  d.zoneM.opacity = c.phase === 'burn' ? 0.16 + Math.random() * 0.05 : c.phase === 'warn' ? 0.05 + 0.08 * (0.5 + 0.5 * Math.sin(tt * (6 + (DRAGON_WARN - c.left) * 1.5))) : 0;
+  // sounds and on-screen warnings, once per phase change / second
+  if (c.phase !== d.lastPhase) {
+    if (c.phase === 'warn') sfx.roar();
+    if (c.phase === 'burn') sfx.breath();
+    d.lastPhase = c.phase;
+  }
+  if (c.phase === 'warn' && state === 'play' && player) {
+    const n = Math.ceil(c.left);
+    if (n !== d.lastCount) {
+      d.lastCount = n;
+      const doomed = player.alive && player.pos.z * c.side > -DRAGON_SAFE;
+      announce('DRAKEN!', doomed ? `Ta dig till andra halvan! ${n}` : `Stanna på den här halvan ${n}`);
+    }
+  } else d.lastCount = -1;
+  // fire breath: particles from the mouth down onto random spots in the burning half
+  if (c.phase === 'burn') {
+    d.emit += dt * 420;
+    d.mouth.getWorldPosition(_dm);
+    while (d.emit >= 1) {
+      d.emit--;
+      const i = d.fi++ % d.N, tx = (Math.random() * 2 - 1) * 900, tz = c.side * (DRAGON_SAFE + 60 + Math.random() * 3000), fl = 0.55 + Math.random() * 0.35;
+      d.pos.set([_dm.x, _dm.y, _dm.z], i * 3);
+      d.vel.set([(tx - _dm.x) / fl, (Math.random() * 60 - _dm.y) / fl, (tz - _dm.z) / fl], i * 3);
+      d.life[i] = fl + 0.6;
+    }
+  }
+  const a = d.fg.attributes.position;
+  for (let i = 0; i < d.N; i++) {
+    if (d.life[i] <= 0) { if (d.pos[i * 3 + 1] > -1e4) d.pos[i * 3 + 1] = -1e5; continue; }
+    d.life[i] -= dt;
+    d.pos[i * 3] += d.vel[i * 3] * dt; d.pos[i * 3 + 1] += d.vel[i * 3 + 1] * dt; d.pos[i * 3 + 2] += d.vel[i * 3 + 2] * dt;
+    if (d.pos[i * 3 + 1] < 20) { d.vel[i * 3] *= 0.2; d.vel[i * 3 + 2] *= 0.2; d.vel[i * 3 + 1] = 40; } // splash and burn on the ground
+  }
+  a.needsUpdate = true;
+}
+
 // ================= Powerup visuals =================
 for (const p of powerups) {
   const def = PU[p.type], g = new T.Group();
@@ -1049,6 +1185,8 @@ const sfx = {
   respawnPu(pos) { if (!AC) return; tone(out(pos, 0.7), 'sine', 600, 1200, 0.25, 0.1); },
   missile(pos) { if (!AC || !sfxGate('missile', 0.08)) return; const d = out(pos, 0.7); tone(d, 'sawtooth', 300, 900, 0.18, 0.06); noise(d, 0.2, 0.12, 1800, 1); },
   boom(pos) { if (!AC || !sfxGate('boom', 0.07)) return; const d = out(pos, 1.1); noise(d, 0.45, 0.6, 320, 0.6); tone(d, 'sine', 120, 40, 0.4, 0.25); },
+  roar() { if (!AC) return; const d = out(null, 1); tone(d, 'sawtooth', 110, 42, 2.4, 0.45); tone(d, 'square', 160, 55, 2.0, 0.18, 0.1); noise(d, 2.2, 0.45, 420, 0.7); },
+  breath() { if (!AC) return; const d = out(null, 1); noise(d, 4, 0.55, 900, 0.5); noise(d, 4, 0.35, 260, 0.8); tone(d, 'sawtooth', 70, 50, 4, 0.12); },
   click() { if (!AC) return; tone(out(null, 1), 'square', 90, 60, 0.05, 0.05); },
 };
 
@@ -1328,6 +1466,10 @@ function turnToward(a, b, max) {
 function pickGoal(b) {
   const s = b.bot, start = nearestWp(b.pos);
   let goal;
+  if (dragonDanger(b)) { // the dragon is about to burn our half: run for the other one
+    const safe = reach.filter(i => wps[i].z * dragon.side < -150);
+    if (safe.length) { let bi = safe[0], bd = Infinity; for (const i of safe) { const w = wps[i], dd = Math.hypot(w.x - b.pos.x, w.z - b.pos.z) + Math.random() * 300; if (dd < bd) { bd = dd; bi = i; } } s.path = findPath(start, bi); s.pi = 0; s.repathT = 3; return; }
+  }
   const avail = powerups.filter(p => p.active && !(p.type === 'shield' && b.shield));
   const r = Math.random();
   if (avail.length && r < 0.4) goal = avail[Math.random() * avail.length | 0].wp;
@@ -1367,6 +1509,9 @@ function botTick(b, dt) {
 
   // navigation
   s.repathT -= dt;
+  const danger = dragonDanger(b);
+  if (danger && !s.fleeing) s.path = null; // drop whatever we were doing
+  s.fleeing = danger;
   if (!s.path || s.pi >= s.path.length || s.repathT <= 0) pickGoal(b);
   let mvx = 0, mvz = 0;
   if (s.path && s.pi < s.path.length) {
@@ -1997,6 +2142,7 @@ function tick() {
   }
   updatePowerups(TICK);
   updateMissiles(TICK);
+  dragonTick();
 }
 
 let acc = 0, last = performance.now(), orbit = 0;
@@ -2031,7 +2177,7 @@ function frame(t) {
     p.mesh.visible = p.active; p.mesh.rotation.y += dt * 1.8; p.mesh.position.y = p.y + 22 + Math.sin(now * 2.5 + p.x) * 2.5;
     p.ring.material.opacity = p.active ? 0.6 : 0.15;
   }
-  if (sim) { updateFx(dt); updateSmoke(dt); const pa = pollen.geometry.attributes.position; for (let i = 0; i < pa.count; i++) { let y = pa.getY(i) + dt * 6; if (y > 460) y = 0; pa.setY(i, y); } pa.needsUpdate = true; }
+  if (sim) { updateFx(dt); updateSmoke(dt); updateDragon(dt); const pa = pollen.geometry.attributes.position; for (let i = 0; i < pa.count; i++) { let y = pa.getY(i) + dt * 6; if (y > 460) y = 0; pa.setY(i, y); } pa.needsUpdate = true; }
 
   // zoom: instant, no scope overlay; mouse speed follows the narrower view
   zoomHeld = state === 'play' && !!player && player.alive && !!(settings.jumpkey === 'space' ? keys.Mouse2 : keys.Space);
